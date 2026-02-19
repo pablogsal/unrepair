@@ -1,10 +1,12 @@
 use anyhow::Result;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
-use clap::{ColorChoice, Parser, ValueEnum, ValueHint};
-use std::path::PathBuf;
+use clap::{ColorChoice, Parser, Subcommand, ValueEnum, ValueHint};
+use std::path::{Path, PathBuf};
 use std::process;
 
 use unrepair::{check_compatibility, report, Verdict};
+
+mod wheel;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -22,40 +24,35 @@ enum PatchNeededFrom {
 #[command(
     name = "unrepair",
     version,
-    about = "Undo auditwheel vendoring for one shared library in an extension module",
-    long_about = "unrepair is for 'unvendoring' one bundled shared library from an \
-                  auditwheel-repaired extension module so it can link against a system \
-                  library instead.\n\n\
-                  It first performs ABI safety checks using ELF metadata — symbol tables, \
-                  version definitions, and SONAMEs — to determine whether the system \
-                  library can safely replace the bundled one at runtime. If compatible, \
-                  it can patch the extension's DT_NEEDED entry to point to the system \
-                  library.",
-    after_long_help = "\x1b[1;32mExamples:\x1b[0m\n  \
-                       Check compatibility:\n    \
-                       $ unrepair --extension myext.cpython-313-x86_64-linux-gnu.so \\\n      \
-                              --bundled vendor/libfoo.so.3 \\\n      \
-                              --system /usr/lib/libfoo.so.3\n\n  \
-                       Check and patch in one step:\n    \
-                       $ unrepair --extension myext.so --bundled vendor/libfoo.so.3 \\\n      \
-                              --system /usr/lib/libfoo.so.3 --patch\n\n  \
-                       JSON output for CI:\n    \
-                       $ unrepair --extension myext.so --bundled vendor/libfoo.so.3 \\\n      \
-                              --system /usr/lib/libfoo.so.3 --format json\n\n  \
-                       Verbose output with colors:\n    \
-                       $ unrepair --extension myext.so --bundled vendor/libfoo.so.3 \\\n      \
-                              --system /usr/lib/libfoo.so.3 --verbose --color=always",
+    about = "Undo auditwheel vendoring for extension modules and wheels",
     styles = STYLES,
+    subcommand_required = true,
+    arg_required_else_help = true
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Check(CheckArgs),
+    Wheel(WheelWorkflowArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    about = "Check and optionally patch one extension module against one system library",
+    long_about = "Check ABI compatibility between one extension module, one bundled shared \
+                  library, and one system shared library. Optionally patch DT_NEEDED when \
+                  the verdict is compatible."
+)]
+struct CheckArgs {
     #[arg(
         long,
         value_name = "FILE",
         value_hint = ValueHint::FilePath,
         help = "Path to the extension module (.so) that imports symbols",
-        long_help = "Path to the extension module (.so) that imports symbols. \
-                     This is the shared object whose DT_NEEDED entries and \
-                     imported symbols are inspected.",
         display_order = 1,
     )]
     extension: PathBuf,
@@ -65,9 +62,6 @@ struct Cli {
         value_name = "FILE",
         value_hint = ValueHint::FilePath,
         help = "Path to the bundled shared library",
-        long_help = "Path to the bundled shared library that the extension was \
-                     originally linked against. Its exported symbols and version \
-                     definitions serve as the baseline for comparison.",
         display_order = 2,
     )]
     bundled: PathBuf,
@@ -77,9 +71,6 @@ struct Cli {
         value_name = "FILE",
         value_hint = ValueHint::FilePath,
         help = "Path to the system shared library to check against",
-        long_help = "Path to the system shared library to check against. \
-                     unrepair verifies that every symbol the extension needs \
-                     is present in this library with a compatible version.",
         display_order = 3,
     )]
     system: PathBuf,
@@ -87,9 +78,6 @@ struct Cli {
     #[arg(
         long,
         help = "Patch the extension's DT_NEEDED entry to use the system library",
-        long_help = "Patch the extension's DT_NEEDED entry to use the system \
-                     library. Only takes effect when the verdict is COMPATIBLE. \
-                     Rewrites the SONAME reference in-place (or to --output).",
         display_order = 4
     )]
     patch: bool,
@@ -100,9 +88,6 @@ struct Cli {
         default_value = "soname",
         requires = "patch",
         help = "How to derive the replacement DT_NEEDED value for --patch",
-        long_help = "How to derive the replacement DT_NEEDED value for --patch. \
-                     'soname' (default) uses the system library SONAME. \
-                     'system-path' uses the exact --system path as DT_NEEDED.",
         display_order = 5
     )]
     patch_needed_from: PatchNeededFrom,
@@ -116,14 +101,7 @@ struct Cli {
     )]
     output: Option<PathBuf>,
 
-    #[arg(
-        long,
-        short,
-        help = "Enable verbose output",
-        long_help = "Enable verbose output. Shows INFO-level diagnostics in \
-                     addition to warnings and errors.",
-        display_order = 7
-    )]
+    #[arg(long, short, help = "Enable verbose output", display_order = 7)]
     verbose: bool,
 
     #[arg(
@@ -139,9 +117,79 @@ struct Cli {
         value_name = "WHEN",
         default_value = "auto",
         help = "Control colored output",
-        long_help = "Control colored output. 'auto' enables color when stderr \
-                     is a terminal, 'always' forces color on, 'never' disables it.",
         display_order = 9
+    )]
+    color: ColorChoice,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    about = "Full wheel workflow: discover, check, unrepair, and repackage",
+    long_about = "Process a wheel end-to-end. unrepair discovers bundled vendored shared \
+                  libraries, matches them against provided system libraries, checks ABI \
+                  compatibility, patches extension DT_NEEDED entries, removes unneeded \
+                  bundled libs, and writes a new wheel."
+)]
+struct WheelWorkflowArgs {
+    #[arg(
+        long,
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath,
+        help = "Input wheel file (.whl)"
+    )]
+    wheel: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath,
+        help = "Output wheel path (default: <input>.unrepaired.whl)"
+    )]
+    output_wheel: Option<PathBuf>,
+
+    #[arg(
+        long = "system-lib",
+        value_name = "FILE",
+        value_hint = ValueHint::FilePath,
+        help = "System library candidate file (repeatable)"
+    )]
+    system_lib: Vec<PathBuf>,
+
+    #[arg(
+        long = "system-lib-dir",
+        value_name = "DIR",
+        value_hint = ValueHint::DirPath,
+        help = "Directory to recursively scan for system libraries (repeatable)"
+    )]
+    system_lib_dir: Vec<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        value_hint = ValueHint::DirPath,
+        help = "Directory where temporary unpacked wheel data should be created"
+    )]
+    workdir: Option<PathBuf>,
+
+    #[arg(
+        long = "no-strict",
+        action = clap::ArgAction::SetFalse,
+        default_value_t = true,
+        help = "Best-effort mode: return zero even if some requested unrepair actions fail"
+    )]
+    strict: bool,
+
+    #[arg(long, short, help = "Enable verbose output")]
+    verbose: bool,
+
+    #[arg(long, default_value = "text", help = "Output format")]
+    format: report::OutputFormat,
+
+    #[arg(
+        long,
+        value_name = "WHEN",
+        default_value = "auto",
+        help = "Control colored output"
     )]
     color: ColorChoice,
 }
@@ -150,42 +198,46 @@ fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let color_choice = match cli.color {
-        ColorChoice::Auto => report::ColorMode::Auto,
-        ColorChoice::Always => report::ColorMode::Always,
-        ColorChoice::Never => report::ColorMode::Never,
-    };
+    match cli.command {
+        Commands::Check(args) => run_check(args),
+        Commands::Wheel(args) => run_wheel(args),
+    }
+}
 
-    let result = check_compatibility(&cli.extension, &cli.bundled, &cli.system)?;
+fn run_check(args: CheckArgs) -> Result<()> {
+    let color_choice = to_color_mode(args.color);
+    let result = check_compatibility(&args.extension, &args.bundled, &args.system)?;
 
-    match cli.format {
-        report::OutputFormat::Text => report::print_text(&result, cli.verbose, color_choice),
+    match args.format {
+        report::OutputFormat::Text => report::print_text(&result, args.verbose, color_choice),
         report::OutputFormat::Json => report::print_json(&result)?,
     }
 
-    if cli.patch && result.verdict == Verdict::Compatible {
-        let bundled_soname = unrepair::elf::soname::extract_soname(&cli.bundled)?;
+    if args.patch && result.verdict == Verdict::Compatible {
+        let bundled_soname = unrepair::elf::soname::extract_soname(&args.bundled)?;
         let old_lib = bundled_soname.unwrap_or_default();
         if old_lib.is_empty() {
-            eprintln!("Error: Cannot patch — missing SONAME in bundled library");
+            eprintln!("Error: Cannot patch - missing SONAME in bundled library");
             process::exit(1);
         }
 
-        let new_lib = match cli.patch_needed_from {
+        let new_lib = match args.patch_needed_from {
             PatchNeededFrom::Soname => {
-                let system_soname = unrepair::elf::soname::extract_soname(&cli.system)?;
+                let system_soname = unrepair::elf::soname::extract_soname(&args.system)?;
                 let soname = system_soname.unwrap_or_default();
                 if soname.is_empty() {
-                    eprintln!("Error: Cannot patch with --patch-needed-from=soname — missing SONAME in system library");
+                    eprintln!(
+                        "Error: Cannot patch with --patch-needed-from=soname - missing SONAME in system library"
+                    );
                     process::exit(1);
                 }
                 soname
             }
-            PatchNeededFrom::SystemPath => cli.system.to_string_lossy().to_string(),
+            PatchNeededFrom::SystemPath => args.system.to_string_lossy().to_string(),
         };
 
-        let output_path = cli.output.as_ref().unwrap_or(&cli.extension);
-        unrepair::patch::replace_needed(&cli.extension, output_path, &old_lib, &new_lib)?;
+        let output_path = args.output.as_ref().unwrap_or(&args.extension);
+        unrepair::patch::replace_needed(&args.extension, output_path, &old_lib, &new_lib)?;
         eprintln!("Patched DT_NEEDED: {} -> {}", old_lib, new_lib);
     }
 
@@ -193,6 +245,46 @@ fn main() -> Result<()> {
         Verdict::Compatible => 0,
         Verdict::Incompatible => 1,
     };
-
     process::exit(exit_code);
+}
+
+fn run_wheel(args: WheelWorkflowArgs) -> Result<()> {
+    let color_mode = to_color_mode(args.color);
+    let output_wheel = args
+        .output_wheel
+        .unwrap_or_else(|| default_output_wheel(&args.wheel));
+
+    let result = wheel::run(wheel::WheelArgs {
+        wheel: &args.wheel,
+        output_wheel: &output_wheel,
+        system_libs: &args.system_lib,
+        system_lib_dirs: &args.system_lib_dir,
+        strict: args.strict,
+        color_mode,
+        verbose: args.verbose,
+        workdir: args.workdir.as_deref(),
+    })?;
+
+    match args.format {
+        report::OutputFormat::Text => wheel::print_text(&result, color_mode),
+        report::OutputFormat::Json => wheel::print_json(&result)?,
+    }
+    process::exit(wheel::exit_code(&result));
+}
+
+fn to_color_mode(choice: ColorChoice) -> report::ColorMode {
+    match choice {
+        ColorChoice::Auto => report::ColorMode::Auto,
+        ColorChoice::Always => report::ColorMode::Always,
+        ColorChoice::Never => report::ColorMode::Never,
+    }
+}
+
+fn default_output_wheel(input: &Path) -> PathBuf {
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    parent.join(format!("{stem}.unrepaired.whl"))
 }

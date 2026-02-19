@@ -35,10 +35,14 @@ cargo install --path .
 
 ## Usage
 
+`unrepair` now has two subcommands:
+- `unrepair check` for one extension/bundled/system triple
+- `unrepair wheel` for full wheel workflow (discover + check + patch + remove + repackage)
+
 ```console
-$ unrepair --extension myext.cpython-313-x86_64-linux-gnu.so \
-          --bundled vendor/libfoo.so.3 \
-          --system /usr/lib/libfoo.so.3
+$ unrepair check --extension myext.cpython-313-x86_64-linux-gnu.so \
+                --bundled vendor/libfoo.so.3 \
+                --system /usr/lib/libfoo.so.3
 
 Verdict: COMPATIBLE
 ```
@@ -46,9 +50,9 @@ Verdict: COMPATIBLE
 When things don't line up, `unrepair` will tell you exactly why:
 
 ```console
-$ unrepair --extension myext.so \
-          --bundled vendor/libfoo.so.1 \
-          --system /usr/lib/libfoo.so.2
+$ unrepair check --extension myext.so \
+                --bundled vendor/libfoo.so.1 \
+                --system /usr/lib/libfoo.so.2
 ERROR (Elf) [multiply]: Symbol 'multiply' needed by extension but not exported by system library
 WARN  (Elf): SONAME mismatch: bundled has 'libfoo.so.1', system has 'libfoo.so.2'
 
@@ -59,10 +63,10 @@ Verdict: INCOMPATIBLE
 If everything checks out, `--patch` does the actual surgery:
 
 ```console
-$ unrepair --extension myext.so \
-          --bundled vendor/libfoo.so.3 \
-          --system /usr/lib/libfoo.so.3 \
-          --patch
+$ unrepair check --extension myext.so \
+                --bundled vendor/libfoo.so.3 \
+                --system /usr/lib/libfoo.so.3 \
+                --patch
 
 Verdict: COMPATIBLE
 Patched DT_NEEDED: libfoo.so.3 -> libfoo.so.3
@@ -71,13 +75,24 @@ Patched DT_NEEDED: libfoo.so.3 -> libfoo.so.3
 If you want GNU loader style full-path `DT_NEEDED`, use:
 
 ```console
-$ unrepair --extension myext.so \
-          --bundled vendor/libfoo.so.3 \
-          --system /opt/vendor/libfoo.so.3 \
-          --patch --patch-needed-from system-path
+$ unrepair check --extension myext.so \
+                --bundled vendor/libfoo.so.3 \
+                --system /opt/vendor/libfoo.so.3 \
+                --patch --patch-needed-from system-path
+```
+
+Full wheel workflow with system library files and directories:
+
+```console
+$ unrepair wheel --wheel dist/mypkg-1.2.3-cp311-cp311-manylinux_2_28_x86_64.whl \
+                --system-lib /usr/lib64/libjpeg.so.62 \
+                --system-lib-dir /usr/lib64 \
+                --output-wheel dist/mypkg-1.2.3.unrepaired.whl
 ```
 
 ## Options
+
+`check`:
 
 ```
 --extension <FILE>  Path to the extension module (.so)
@@ -90,6 +105,20 @@ $ unrepair --extension myext.so \
 -v, --verbose       Show INFO-level diagnostics
 --format <FORMAT>   Output format: text (default) or json
 --color <WHEN>      Color output: auto (default), always, or never
+```
+
+`wheel`:
+
+```
+--wheel <FILE>            Input wheel file (.whl)
+--output-wheel <FILE>     Output wheel path (default: <input>.unrepaired.whl)
+--system-lib <FILE>       System library candidate file (repeatable)
+--system-lib-dir <DIR>    Directory to recursively scan for system libs (repeatable)
+--workdir <DIR>           Parent directory for temporary unpacked wheel data
+--no-strict               Best-effort mode (return zero even when some checks fail)
+-v, --verbose             Show additional workflow details
+--format <FORMAT>         Output format: text (default) or json
+--color <WHEN>            Color output: auto (default), always, or never
 ```
 
 ## License

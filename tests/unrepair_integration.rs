@@ -531,6 +531,7 @@ fn cli_patch_can_use_system_path_for_dt_needed() {
     // WHEN
     let output = run_output(
         Command::new(unrepair_bin())
+            .arg("check")
             .arg("--extension")
             .arg(&ext)
             .arg("--bundled")
@@ -699,6 +700,7 @@ fn cli_patch_is_skipped_when_validation_fails() {
     // WHEN
     let output = run_output(
         Command::new(unrepair_bin())
+            .arg("check")
             .arg("--extension")
             .arg(&ext)
             .arg("--bundled")
